@@ -247,7 +247,57 @@ public class WhisperWebsocket
         if (!isConnected)
         {
             Statistics.incrementTotalTranscriberConnectionErrors();
-            logger.error("Failed connecting to " + websocketUrl + ". Nothing to do.");
+            logger.error("Failed connecting to " + websocketUrl
+                    + " after " + maxRetryAttempts + " attempts.");
+            reconnecting = false;
+
+            if (isRunning())
+            {
+                // Participants are still in the room but we can't talk to
+                // Whisper. Signal upstream so the transcription session
+                // ends cleanly — TranscriptionGatewaySession implements
+                // TranscriptionListener.failed() by calling
+                // jvbConference.stop(), which fires
+                // transcribingStatusChanged:false on all clients. The
+                // client-side decides whether to re-request captions.
+                threadPool.submit(this::signalTranscriptionFailure);
+            }
+            else
+            {
+                logger.info("No participants remain; nothing to do.");
+            }
+        }
+    }
+
+    /**
+     * Notify the surrounding Jigasi session that transcription has failed
+     * beyond recovery. Runs on the thread pool so we don't hold the reconnect
+     * thread while `Transcriber.stop` iterates its listener list. All
+     * participants in a room share one `Transcriber`, so we just grab any
+     * `Participant` from our map and go through it.
+     */
+    private void signalTranscriptionFailure()
+    {
+        try
+        {
+            Map<String, Participant> current = this.participants;
+            if (current == null || current.isEmpty())
+            {
+                return;
+            }
+            Participant anyParticipant = current.values().iterator().next();
+            Transcriber transcriber = anyParticipant.getTranscriber();
+            if (transcriber == null || !transcriber.isTranscribing())
+            {
+                return;
+            }
+            logger.warn("Signalling transcription failure to Jigasi — "
+                    + "captions will show as unavailable on clients.");
+            transcriber.stop(TranscriptionListener.FailureReason.CONNECTION_LOST);
+        }
+        catch (Exception e)
+        {
+            logger.error("Error while signalling transcription failure", e);
         }
     }
 

@@ -55,6 +55,17 @@ public interface TranscriptionListener
          * The request quota limit set by the transcription service provider
          * has been exhausted.
          */
-        RESOURCES_EXHAUSTED
+        RESOURCES_EXHAUSTED,
+
+        /**
+         * The underlying transport to the transcription service was lost
+         * and could not be re-established within the retry budget. Fired
+         * by the Whisper backend after `maxRetryAttempts` reconnect
+         * attempts fail while participants are still in the room. The
+         * client-side is expected to observe the resulting
+         * `transcribingStatusChanged:false` event and decide whether to
+         * re-request captions.
+         */
+        CONNECTION_LOST
     }
 }
