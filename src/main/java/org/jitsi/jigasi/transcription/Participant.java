@@ -27,7 +27,6 @@ import org.jivesoftware.smack.packet.*;
 import org.jitsi.jigasi.stats.*;
 
 import javax.media.format.*;
-import java.nio.*;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -69,6 +68,26 @@ public class Participant
      * Whether we should buffer locally before sending
      */
     private static final boolean USE_LOCAL_BUFFER = true;
+
+    /**
+     * Send whatever is in the local buffer once no audio has arrived for this
+     * long. The bridge stops forwarding a participant's audio while they are
+     * silent, so without this the last part of an utterance (up to a whole
+     * buffer) would wait until they speak again or mute.
+     */
+    private static final long IDLE_FLUSH_MILLIS = 300;
+
+    /**
+     * Fires the idle flushes. The flush itself runs on the transcriber's
+     * executor, so the buffer is only ever touched from that one thread.
+     */
+    private static final ScheduledExecutorService IDLE_FLUSH_TIMER
+        = Executors.newSingleThreadScheduledExecutor(r ->
+            {
+                Thread t = new Thread(r, "jigasi-transcriber-idle-flush");
+                t.setDaemon(true);
+                return t;
+            });
 
     /**
      * The string to use when a participant's name is unknown.
@@ -120,7 +139,14 @@ public class Participant
     /**
      * A buffer which is used to locally store audio before sending
      */
-    private final ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+    private final LocalAudioBuffer buffer
+        = new LocalAudioBuffer(BUFFER_SIZE, EXPECTED_AUDIO_LENGTH);
+
+    /**
+     * The pending idle flush of {@link #buffer}, if any. Only accessed from
+     * the transcriber's executor.
+     */
+    private ScheduledFuture<?> idleFlush = null;
 
     /**
      * The AudioFormat of the audio being read. It is assumed to not change
@@ -626,8 +652,8 @@ public class Participant
                    }
                    else if (silenceFilter.newSpeech())
                    {
-                       // we need to cast here to keep compatability when moving between java8 and java11
-                       ((Buffer) buffer).clear();
+                       // the speech window replaces what was buffered
+                       buffer.drain();
                        toBuffer = silenceFilter.getSpeechWindow();
                    }
                    else
@@ -640,23 +666,75 @@ public class Participant
                    toBuffer = audio;
                }
 
-               try
+               for (byte[] block : buffer.put(toBuffer, System.currentTimeMillis()))
                {
-                   buffer.put(toBuffer);
+                   sendRequest(block);
                }
-               catch (BufferOverflowException | ReadOnlyBufferException e)
-               {
-                   sendRequest(audio);
-               }
-
-               int spaceLeft = buffer.limit() - buffer.position();
-               if (spaceLeft < EXPECTED_AUDIO_LENGTH)
-               {
-                   sendRequest(buffer.array());
-                   // we need to cast here to keep compatability when moving between java8 and java11
-                   ((Buffer) buffer).clear();
-               }
+               scheduleIdleFlush(IDLE_FLUSH_MILLIS);
            });
+    }
+
+    /**
+     * Sends what is in the local buffer, if anything. Must run on the
+     * transcriber's executor.
+     */
+    private void sendBuffered()
+    {
+        byte[] block = buffer.drain();
+        if (block != null)
+        {
+            sendRequest(block);
+        }
+    }
+
+    /**
+     * Makes sure an idle flush is pending while the local buffer holds audio.
+     * Must run on the transcriber's executor.
+     *
+     * @param delayMillis how long from now to check
+     */
+    private void scheduleIdleFlush(long delayMillis)
+    {
+        if (buffer.size() == 0 || (idleFlush != null && !idleFlush.isDone()))
+        {
+            return;
+        }
+        idleFlush = IDLE_FLUSH_TIMER.schedule(() ->
+            {
+                try
+                {
+                    transcriber.executorService.execute(this::flushIfIdle);
+                }
+                catch (RejectedExecutionException e)
+                {
+                    // the transcriber has stopped
+                }
+            },
+            delayMillis,
+            TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Sends the local buffer if no audio has arrived for
+     * {@link #IDLE_FLUSH_MILLIS}; otherwise checks again later. Runs on the
+     * transcriber's executor.
+     */
+    private void flushIfIdle()
+    {
+        idleFlush = null;
+        if (buffer.size() == 0)
+        {
+            return;
+        }
+        long idle = buffer.idleMillis(System.currentTimeMillis());
+        if (idle >= IDLE_FLUSH_MILLIS)
+        {
+            sendBuffered();
+        }
+        else
+        {
+            scheduleIdleFlush(IDLE_FLUSH_MILLIS - idle);
+        }
     }
 
     private void incrementSentStats(int byteCount)
@@ -796,12 +874,15 @@ public class Participant
         return ext != null && Boolean.parseBoolean(ext.getText());
     }
 
+    /**
+     * Sends whatever is in the local buffer now (called when the participant
+     * mutes). Sends only the audio buffered since the last send, and nothing
+     * if that is empty: this runs on every presence update while the
+     * participant is muted, not just once.
+     */
     public void flushBuffer()
     {
-        transcriber.executorService.execute(() -> {
-            sendRequest(buffer.array());
-            ((Buffer) buffer).clear();
-        });
+        transcriber.executorService.execute(this::sendBuffered);
     }
 
     /**
